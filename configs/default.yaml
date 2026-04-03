@@ -1,4 +1,4 @@
-# Configuración del proyecto Neural ODE Autoencoder
+# Neural ODE Autoencoder — Project Configuration
 
 data:
   raw_dir: data/raw
