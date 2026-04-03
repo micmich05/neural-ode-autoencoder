@@ -1,0 +1,56 @@
+# Configuración del proyecto Neural ODE Autoencoder
+
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  dataset: cse-cic-ids2018
+
+preprocessing:
+  window_size_seconds: 30
+  min_flows_per_window: 5
+  metadata_columns:
+    - Flow ID
+    - Source IP
+    - Source Port
+    - Destination IP
+    - Destination Port
+    - Protocol
+    - Timestamp
+    - Label
+
+  split:
+    train: 0.70
+    val: 0.15
+    test: 0.15
+
+  scaler: robust  # RobustScaler (median + IQR)
+
+model:
+  encoder:
+    type: bigru
+    hidden_size: 128
+    num_layers: 2
+    bidirectional: true
+
+  latent_dim: 32
+
+  neural_ode:
+    hidden_size: 128
+    activation: silu
+    solver: dopri5
+    atol: 1.0e-5
+    rtol: 1.0e-5
+    integration_time: 1.0
+
+  decoder:
+    hidden_size: 128
+    activation: silu
+
+training:
+  batch_size: 256
+  learning_rate: 1.0e-3
+  weight_decay: 1.0e-5
+  epochs: 50
+  optimizer: adam
+  scheduler: cosine
+  early_stopping_patience: 5
