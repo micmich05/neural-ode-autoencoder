@@ -6,17 +6,49 @@ data:
   dataset: cse-cic-ids2018
 
 preprocessing:
-  window_size: 50          # flows per window (sequential windowing)
-  drop_duplicates: true    # remove fully duplicated rows (~5% of dataset)
-  metadata_columns:
-    - Label                # only non-numeric column remaining in parquet files
+  window_size: 50          # flows per window
+  random_state: 42         # reproducible stratified split
+
+  # Features to drop (see notebooks/02_feature_engineering.ipynb for rationale)
+  features_to_drop:
+    # Zero-variance (constant 0 across all rows)
+    - Bwd PSH Flags
+    - Bwd URG Flags
+    - Fwd Avg Bytes/Bulk
+    - Fwd Avg Packets/Bulk
+    - Fwd Avg Bulk Rate
+    - Bwd Avg Bytes/Bulk
+    - Bwd Avg Packets/Bulk
+    - Bwd Avg Bulk Rate
+    # Perfectly correlated duplicates (r=1.0)
+    - Subflow Fwd Packets      # = Total Fwd Packets
+    - Subflow Bwd Packets      # = Total Backward Packets
+    - Subflow Fwd Bytes         # = Fwd Packets Length Total
+    - Subflow Bwd Bytes         # ≈ Bwd Packets Length Total
+    - Avg Fwd Segment Size      # = Fwd Packet Length Mean
+    - Avg Bwd Segment Size      # = Bwd Packet Length Mean
+    - Fwd PSH Flags             # = SYN Flag Count
+    - CWE Flag Count            # = Fwd URG Flags
+    - ECE Flag Count            # = RST Flag Count
+    - Fwd IAT Total             # = Flow Duration
+    - Fwd IAT Std               # = Flow IAT Std
+    - Fwd IAT Max               # = Flow IAT Max
+    - Fwd IAT Min               # = Flow IAT Min
+    - Idle Std                  # = Flow IAT Std
+    - Idle Max                  # = Flow IAT Max
+    - Idle Min                  # ≈ Flow IAT Min
+    # Low-information / near-duplicates
+    - Fwd Seg Size Min          # maps directly to Protocol (3 values)
+    - Fwd URG Flags             # 0.03% non-zero, redundant with URG Flag Count
+    - Fwd Act Data Packets      # r=0.9996 with Total Fwd Packets
+    - Packet Length Variance     # = Packet Length Std²
 
   split:
     train: 0.70
     val: 0.15
     test: 0.15
 
-  scaler: robust  # RobustScaler (median + IQR)
+  scaler: robust  # RobustScaler fitted on train-benign only
 
 model:
   encoder:
