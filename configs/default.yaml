@@ -1,22 +1,15 @@
 # Neural ODE Autoencoder — Project Configuration
 
 data:
-  raw_dir: data/raw
+  raw_dir: data/raw/archive
   processed_dir: data/processed
   dataset: cse-cic-ids2018
 
 preprocessing:
-  window_size_seconds: 30
-  min_flows_per_window: 5
+  window_size: 50          # flows per window (sequential windowing)
+  drop_duplicates: true    # remove fully duplicated rows (~5% of dataset)
   metadata_columns:
-    - Flow ID
-    - Source IP
-    - Source Port
-    - Destination IP
-    - Destination Port
-    - Protocol
-    - Timestamp
-    - Label
+    - Label                # only non-numeric column remaining in parquet files
 
   split:
     train: 0.70

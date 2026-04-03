@@ -1,9 +1,9 @@
 """
-Preprocessing pipeline for CSE-CIC-IDS2018.
+Preprocessing pipeline for CSE-CIC-IDS2018 (parquet format).
 
-Loads raw CSVs, cleans known data quality issues, segments flows into
-temporal windows, normalizes features, and saves train/val/test splits
-as PyTorch tensors.
+Loads parquet files, removes duplicates, segments flows into sequential
+windows, normalizes features, and saves train/val/test splits as PyTorch
+tensors.
 
 Usage:
     python src/preprocessing.py
@@ -28,16 +28,15 @@ def load_config(config_path: str = "configs/default.yaml") -> dict:
 
 
 def load_raw_data(raw_dir: str) -> pd.DataFrame:
-    """Load all CSVs from the directory and concatenate into a single DataFrame."""
-    csv_files = sorted(Path(raw_dir).glob("*.csv"))
-    if not csv_files:
-        raise FileNotFoundError(f"No CSV files found in {raw_dir}")
+    """Load all parquet files from the directory and concatenate into a single DataFrame."""
+    parquet_files = sorted(Path(raw_dir).glob("*.parquet"))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files found in {raw_dir}")
 
     dfs = []
-    for f in csv_files:
+    for f in parquet_files:
         print(f"  Loading {f.name}...", end=" ")
-        df = pd.read_csv(f, encoding="utf-8", low_memory=False)
-        df.columns = df.columns.str.strip()
+        df = pd.read_parquet(f)
         print(f"{len(df):,} rows")
         dfs.append(df)
 
@@ -46,106 +45,80 @@ def load_raw_data(raw_dir: str) -> pd.DataFrame:
     return df_all
 
 
-def clean_data(df: pd.DataFrame, metadata_columns: list[str]) -> tuple[pd.DataFrame, pd.Series]:
-    """Clean the dataset by addressing known CIC-IDS2018 data quality issues."""
+def clean_data(
+    df: pd.DataFrame,
+    metadata_columns: list[str],
+    drop_duplicates: bool = True,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Clean the dataset: remove duplicates, extract labels, drop metadata."""
     n_initial = len(df)
 
-    # 1. Remove rows with duplicate headers embedded as data
-    if "Label" in df.columns:
-        mask = df["Label"] == "Label"
-        n_header_rows = mask.sum()
-        if n_header_rows > 0:
-            df = df[~mask].reset_index(drop=True)
-            print(f"  Removed {n_header_rows:,} duplicate header rows")
+    # 1. Remove fully duplicated rows
+    if drop_duplicates:
+        n_before = len(df)
+        df = df.drop_duplicates().reset_index(drop=True)
+        n_dropped = n_before - len(df)
+        if n_dropped > 0:
+            print(f"  Removed {n_dropped:,} duplicate rows")
 
     # 2. Extract and separate labels
     labels = df["Label"].copy()
 
-    # 3. Remove duplicate 'Fwd Header Length' column
-    fwd_header_cols = [c for c in df.columns if "Fwd Header Length" in c]
-    if len(fwd_header_cols) > 1:
-        to_drop = fwd_header_cols[1:]
-        df = df.drop(columns=to_drop)
-        print(f"  Removed duplicate columns: {to_drop}")
-
-    # 4. Drop metadata columns (IPs, ports, timestamps, labels)
+    # 3. Drop metadata columns (Label is the only non-numeric column in parquet)
     cols_to_drop = [c for c in metadata_columns if c in df.columns]
     df = df.drop(columns=cols_to_drop)
     print(f"  Dropped {len(cols_to_drop)} metadata columns")
 
-    # 5. Convert all remaining columns to numeric
-    for col in df.columns:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    # 6. Replace Inf with NaN
+    # 4. Replace Inf with NaN, then impute with median
     df = df.replace([np.inf, -np.inf], np.nan)
-
-    # 7. Impute NaN with column median
     n_nan = df.isna().sum().sum()
     if n_nan > 0:
-        medians = df.median()
-        df = df.fillna(medians)
+        df = df.fillna(df.median())
         print(f"  Imputed {n_nan:,} NaN/Inf values with column median")
 
     print(f"  Final shape: {df.shape} (from {n_initial:,} initial rows)")
     return df, labels
 
 
-def parse_timestamps(df_original: pd.DataFrame) -> pd.Series:
-    """Parse the Timestamp column from the original DataFrame."""
-    if "Timestamp" not in df_original.columns:
-        raise ValueError("'Timestamp' column not found")
-    return pd.to_datetime(df_original["Timestamp"], errors="coerce", dayfirst=True)
-
-
-def create_temporal_windows(
+def create_sequential_windows(
     features: np.ndarray,
     labels: np.ndarray,
-    timestamps: np.ndarray,
-    window_size_seconds: int = 30,
-    min_flows_per_window: int = 5,
+    window_size: int = 50,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
-    """Segment data into fixed-duration temporal windows."""
-    # Sort by timestamp
-    valid_mask = ~pd.isna(timestamps)
-    sort_idx = np.argsort(timestamps[valid_mask])
+    """Segment data into fixed-size sequential windows.
 
-    features_sorted = features[valid_mask][sort_idx]
-    labels_sorted = labels[valid_mask][sort_idx]
-    timestamps_sorted = timestamps[valid_mask][sort_idx]
+    Since the parquet files lack timestamps, we use sequential windowing:
+    consecutive groups of `window_size` flows form each window. The file
+    order (sorted by date) preserves the original temporal ordering.
+    """
+    n_samples = len(features)
+    n_windows = n_samples // window_size
 
-    # Create windows
     windows = []
     window_labels = []
 
-    ts_series = pd.Series(timestamps_sorted)
-    window_td = pd.Timedelta(seconds=window_size_seconds)
+    for i in range(n_windows):
+        start = i * window_size
+        end = start + window_size
+        windows.append(features[start:end])
+        window_labels.append(labels[start:end])
 
-    current_start = ts_series.iloc[0]
-    end_time = ts_series.iloc[-1]
-
-    while current_start < end_time:
-        window_end = current_start + window_td
-        mask = (ts_series >= current_start) & (ts_series < window_end)
-        indices = np.where(mask.values)[0]
-
-        if len(indices) >= min_flows_per_window:
-            windows.append(features_sorted[indices])
-            window_labels.append(labels_sorted[indices])
-
-        current_start = window_end
-
-    print(f"  Windows created: {len(windows)} (window={window_size_seconds}s, min_flows={min_flows_per_window})")
+    print(f"  Windows created: {n_windows:,} (window_size={window_size} flows)")
     return windows, window_labels
 
 
-def temporal_split(
+def sequential_split(
     windows: list[np.ndarray],
     window_labels: list[np.ndarray],
     train_ratio: float = 0.70,
     val_ratio: float = 0.15,
 ) -> dict:
-    """Temporal (non-random) split into train/val/test."""
+    """Sequential (non-random) split into train/val/test.
+
+    Preserves the file ordering so that earlier capture days go to train,
+    middle days to validation, and later days to test. This prevents data
+    leakage from future observations into training.
+    """
     n = len(windows)
     train_end = int(n * train_ratio)
     val_end = int(n * (train_ratio + val_ratio))
@@ -166,24 +139,9 @@ def temporal_split(
     }
 
     for name, data in splits.items():
-        print(f"  {name}: {len(data['windows'])} windows")
+        print(f"  {name}: {len(data['windows']):,} windows")
 
     return splits
-
-
-def pad_windows(windows: list[np.ndarray], max_len: int | None = None) -> np.ndarray:
-    """Pad variable-length windows to uniform size."""
-    if max_len is None:
-        max_len = max(w.shape[0] for w in windows)
-
-    n_features = windows[0].shape[1]
-    padded = np.zeros((len(windows), max_len, n_features), dtype=np.float32)
-
-    for i, w in enumerate(windows):
-        length = min(w.shape[0], max_len)
-        padded[i, :length, :] = w[:length]
-
-    return padded
 
 
 def aggregate_window_labels(window_labels: list[np.ndarray]) -> np.ndarray:
@@ -195,25 +153,17 @@ def aggregate_window_labels(window_labels: list[np.ndarray]) -> np.ndarray:
     return result
 
 
-def save_splits(splits: dict, scaler: RobustScaler, output_dir: str, max_window_len: int | None = None):
+def save_splits(splits: dict, scaler: RobustScaler, output_dir: str, window_size: int):
     """Save splits as .pt tensors and the scaler as .pkl."""
     os.makedirs(output_dir, exist_ok=True)
-
-    # Determine global max_window_len
-    if max_window_len is None:
-        all_windows = []
-        for split_data in splits.values():
-            all_windows.extend(split_data["windows"])
-        max_window_len = int(np.percentile([w.shape[0] for w in all_windows], 95))
-        print(f"  Max window length (p95): {max_window_len}")
 
     for name, data in splits.items():
         if len(data["windows"]) == 0:
             print(f"  Skipping {name}: no windows")
             continue
 
-        # Pad windows to uniform length
-        X = pad_windows(data["windows"], max_len=max_window_len)
+        # Stack windows — all have the same size (no padding needed)
+        X = np.stack(data["windows"]).astype(np.float32)
         X_tensor = torch.from_numpy(X)
 
         # Per-window labels
@@ -244,42 +194,38 @@ def main():
     print("\n=== 1. Loading raw data ===")
     df_raw = load_raw_data(raw_dir)
 
-    # 2. Parse timestamps (before dropping the column)
-    print("\n=== 2. Parsing timestamps ===")
-    timestamps = parse_timestamps(df_raw)
-    n_valid = timestamps.notna().sum()
-    print(f"  Valid timestamps: {n_valid:,} / {len(timestamps):,}")
+    # 2. Clean data
+    print("\n=== 2. Cleaning data ===")
+    df_clean, labels = clean_data(
+        df_raw,
+        prep_cfg["metadata_columns"],
+        drop_duplicates=prep_cfg.get("drop_duplicates", True),
+    )
 
-    # 3. Clean data
-    print("\n=== 3. Cleaning data ===")
-    df_clean, labels = clean_data(df_raw, prep_cfg["metadata_columns"])
-
-    # 4. Extract features
-    print("\n=== 4. Extracting features ===")
+    # 3. Extract features
+    print("\n=== 3. Extracting features ===")
     feature_names = df_clean.columns.tolist()
     features = df_clean.values.astype(np.float32)
 
-    # 5. Create temporal windows
-    print("\n=== 5. Creating temporal windows ===")
-    windows, window_labels = create_temporal_windows(
+    # 4. Create sequential windows
+    print("\n=== 4. Creating sequential windows ===")
+    windows, window_labels = create_sequential_windows(
         features,
         labels.values,
-        timestamps.values,
-        window_size_seconds=prep_cfg["window_size_seconds"],
-        min_flows_per_window=prep_cfg["min_flows_per_window"],
+        window_size=prep_cfg["window_size"],
     )
 
-    # 6. Temporal split
-    print("\n=== 6. Temporal split ===")
-    splits = temporal_split(
+    # 5. Sequential split
+    print("\n=== 5. Sequential split ===")
+    splits = sequential_split(
         windows,
         window_labels,
         train_ratio=prep_cfg["split"]["train"],
         val_ratio=prep_cfg["split"]["val"],
     )
 
-    # 7. Fit scaler on training data only (prevents data leakage)
-    print("\n=== 7. Fitting scaler on training data ===")
+    # 6. Fit scaler on training data only (prevents data leakage)
+    print("\n=== 6. Fitting scaler on training data ===")
     train_flat = np.concatenate(splits["train"]["windows"], axis=0)
     scaler = RobustScaler()
     scaler.fit(train_flat)
@@ -291,9 +237,9 @@ def main():
             scaler.transform(w).astype(np.float32) for w in splits[split_name]["windows"]
         ]
 
-    # 8. Save
-    print("\n=== 8. Saving splits ===")
-    save_splits(splits, scaler, output_dir)
+    # 7. Save
+    print("\n=== 7. Saving splits ===")
+    save_splits(splits, scaler, output_dir, window_size=prep_cfg["window_size"])
 
     # Save feature names
     with open(os.path.join(output_dir, "feature_names.pkl"), "wb") as f:

@@ -23,14 +23,14 @@ Network Flows → [BiGRU Encoder] → z₀ → [Neural ODE: dz/dt = fθ(z,t)] �
 
 ## Dataset
 
-[CSE-CIC-IDS2018](https://www.unb.ca/cic/datasets/ids-2018.html) — a large-scale intrusion detection dataset with ~16M network flows and ~80 features, including multiple DDoS/DoS attack types.
+[CSE-CIC-IDS2018](https://www.unb.ca/cic/datasets/ids-2018.html) — a large-scale intrusion detection dataset with ~6.7M network flows and 77 numeric features across 10 parquet files, including multiple DDoS/DoS attack types (80% benign, 20% attacks).
 
 The preprocessing pipeline:
-1. Loads raw CSVs and fixes known issues (duplicate headers, Inf/NaN values, duplicate columns)
-2. Segments flows into **temporal windows** (30s default, min 5 flows per window)
-3. Applies **temporal split** (70/15/15) — no data leakage from future to past
+1. Loads parquet files and removes duplicate rows (~5% of dataset)
+2. Segments flows into **sequential windows** (50 flows per window)
+3. Applies **sequential split** (70/15/15) — preserves file ordering to prevent data leakage
 4. Normalizes with **RobustScaler** fitted only on training data
-5. Pads windows and exports as PyTorch tensors
+5. Exports windows as PyTorch tensors
 
 ## Project Structure
 
@@ -38,7 +38,7 @@ The preprocessing pipeline:
 ├── configs/
 │   └── default.yaml          # Model, training, and preprocessing hyperparameters
 ├── data/
-│   ├── raw/                  # Raw CSE-CIC-IDS2018 CSVs (not tracked)
+│   ├── raw/archive/          # Raw CSE-CIC-IDS2018 parquet files (not tracked)
 │   └── processed/            # Preprocessed tensors (not tracked)
 ├── notebooks/
 │   └── 01_eda.ipynb          # Exploratory data analysis
@@ -66,7 +66,7 @@ pip install -r requirements.txt
 
 ### Download the Dataset
 
-Download CSE-CIC-IDS2018 from [Kaggle](https://www.kaggle.com/datasets/solarmainframe/ids-intrusion-csv) or the [UNB CIC website](https://www.unb.ca/cic/datasets/ids-2018.html) and place the CSV files in `data/raw/`.
+Download CSE-CIC-IDS2018 from [Kaggle](https://www.kaggle.com/datasets/solarmainframe/ids-intrusion-csv) or the [UNB CIC website](https://www.unb.ca/cic/datasets/ids-2018.html) and place the parquet files in `data/raw/archive/`.
 
 ### Preprocessing
 
@@ -99,7 +99,7 @@ The model is trained **entirely unsupervised** using reconstruction loss on beni
 
 - **PyTorch** + **torchdiffeq** — Neural ODE implementation
 - **scikit-learn** — Preprocessing and baselines
-- **pandas** / **NumPy** — Data manipulation
+- **pandas** / **NumPy** / **PyArrow** — Data manipulation
 - **MLflow** — Experiment tracking
 - **Matplotlib** / **Plotly** — Visualization
 
