@@ -136,12 +136,6 @@ def train(config: dict):
 
     # Model
     model = NeuralODEAutoencoder(config).to(device)
-
-    # Initialize model with a dummy batch to set input dimensions
-    sample_x, _ = next(iter(loaders["train"]))
-    with torch.no_grad():
-        model(sample_x[:2].to(device))
-
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
 

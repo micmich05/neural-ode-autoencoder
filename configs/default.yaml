@@ -51,6 +51,8 @@ preprocessing:
   scaler: robust  # RobustScaler fitted on train-benign only
 
 model:
+  input_dim: 49               # features after selection (77 - 28 dropped)
+
   encoder:
     type: bigru
     hidden_size: 128

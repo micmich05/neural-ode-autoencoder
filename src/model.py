@@ -131,13 +131,10 @@ class NeuralODEAutoencoder(nn.Module):
         dec_cfg = config["model"]["decoder"]
         latent_dim = config["model"]["latent_dim"]
         window_size = config["preprocessing"]["window_size"]
-
-        # Number of input features (49 after feature selection)
-        # Inferred at first forward pass or set explicitly
-        self.input_dim = None
+        input_dim = config["model"].get("input_dim", 49)
 
         self.encoder = BiGRUEncoder(
-            input_dim=0,  # placeholder, set in _init_input_dim
+            input_dim=input_dim,
             hidden_size=enc_cfg["hidden_size"],
             num_layers=enc_cfg["num_layers"],
             latent_dim=latent_dim,
@@ -152,7 +149,7 @@ class NeuralODEAutoencoder(nn.Module):
             latent_dim=latent_dim,
             hidden_size=dec_cfg["hidden_size"],
             seq_len=window_size,
-            input_dim=0,  # placeholder, set in _init_input_dim
+            input_dim=input_dim,
         )
 
         # ODE solver settings
@@ -162,31 +159,6 @@ class NeuralODEAutoencoder(nn.Module):
         self.integration_time = torch.tensor(
             [0.0, ode_cfg["integration_time"]], dtype=torch.float32
         )
-
-        self._initialized = False
-
-    def _init_input_dim(self, input_dim: int):
-        """Lazily initialize layers that depend on the input feature dimension."""
-        if self._initialized:
-            return
-        device = self.integration_time.device
-
-        self.input_dim = input_dim
-        self.encoder = BiGRUEncoder(
-            input_dim=input_dim,
-            hidden_size=self.encoder.gru.hidden_size,
-            num_layers=self.encoder.gru.num_layers,
-            latent_dim=self.encoder.projection.out_features,
-        ).to(device)
-
-        self.decoder = MLPDecoder(
-            latent_dim=self.decoder.net[0].in_features,
-            hidden_size=self.decoder.net[0].out_features,
-            seq_len=self.decoder.seq_len,
-            input_dim=input_dim,
-        ).to(device)
-
-        self._initialized = True
 
     def forward(
         self, x: torch.Tensor
@@ -200,8 +172,6 @@ class NeuralODEAutoencoder(nn.Module):
             x_hat: Reconstructed windows (B, seq_len, input_dim)
             z0: Latent initial state (B, latent_dim) — useful for visualization
         """
-        self._init_input_dim(x.shape[-1])
-
         # Encode
         z0 = self.encoder(x)  # (B, latent_dim)
 
