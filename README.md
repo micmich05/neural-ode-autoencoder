@@ -94,7 +94,9 @@ The dynamics function $f_\theta$ is an MLP with LayerNorm and SiLU activations t
 
 Reconstructs the full $50 \times 49$ window from the evolved latent vector:
 
-$$z_1 \in \mathbb{R}^{32} \xrightarrow{\text{LN+SiLU+Dropout}} \mathbb{R}^{256} \xrightarrow{\text{LN+SiLU+Dropout}} \mathbb{R}^{256} \xrightarrow{\text{Linear}} \mathbb{R}^{2450} \xrightarrow{\text{reshape}} \hat{x} \in \mathbb{R}^{50 \times 49}$$
+$$z_1 \in \mathbb{R}^{32} \to \mathbb{R}^{256} \to \mathbb{R}^{256} \to \mathbb{R}^{2450} \to \hat{x} \in \mathbb{R}^{50 \times 49}$$
+
+Each hidden layer applies **Linear → LayerNorm → SiLU → Dropout**. The final layer is a plain linear projection reshaped to $(50, 49)$.
 
 No output activation — targets are RobustScaler-transformed and unbounded.
 
