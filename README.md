@@ -1,21 +1,65 @@
 # Neural ODE Autoencoder for DDoS Detection
 
-Unsupervised anomaly detection system for network traffic using a Neural ODE Autoencoder. The model learns the temporal dynamics of normal traffic and flags deviations as potential DDoS attacks — no labeled data is needed during training.
+Unsupervised anomaly detection system for network traffic using a Neural ODE Autoencoder. The model learns the continuous-time dynamics of normal traffic in a latent space and flags deviations as potential DDoS attacks — no labeled data is needed during training.
+
+## Problem Formulation
+
+### Task
+
+**Unsupervised anomaly detection** on network flow data. The model is trained exclusively on benign traffic and must identify attack traffic (DDoS, DoS, brute-force, etc.) at inference time without ever having seen labeled attack examples.
+
+### Input Space
+
+Each sample is a **window** of $T = 50$ consecutive network flows, where each flow is described by $D = 49$ numeric features:
+
+$$X = \{x^{(i)}\}_{i=1}^{N}, \quad x^{(i)} \in \mathbb{R}^{T \times D}$$
+
+The features capture five categories of network behavior: flow-level statistics, directional packet sizes, inter-arrival times, TCP flags, and session behavior indicators. All features are normalized with a RobustScaler fitted on training benign data only.
+
+### Target Variable
+
+The target is a binary label per window:
+
+$$y^{(i)} = \begin{cases} 0 & \text{if all flows in the window are benign} \\ 1 & \text{if all flows in the window are attacks} \end{cases}$$
+
+> **Important:** Labels are never used during training. They are used only for evaluation (AUROC, AUPRC, F1) and threshold selection on the validation set.
+
+### Learning Objective
+
+The model learns a reconstruction function $g_\theta: \mathbb{R}^{T \times D} \to \mathbb{R}^{T \times D}$ by minimizing the reconstruction error on benign windows:
+
+$$\mathcal{L}(\theta) = \frac{1}{N_{\text{benign}}} \sum_{i: y^{(i)}=0} \frac{1}{T \cdot D} \left\| x^{(i)} - g_\theta(x^{(i)}) \right\|_F^2$$
+
+### Anomaly Score
+
+At inference, the **anomaly score** for a new window $x$ is its reconstruction error:
+
+$$s(x) = \frac{1}{T \cdot D} \left\| x - g_\theta(x) \right\|_F^2$$
+
+A window is flagged as anomalous if $s(x) > \tau$, where the threshold $\tau$ is chosen on the validation set to maximize the F1-score.
+
+### Why This Works
+
+The model learns to reconstruct only benign traffic patterns. When it encounters attack traffic:
+1. The encoder maps it to an unfamiliar region of the latent space
+2. The Neural ODE evolves the latent code using dynamics learned from benign data
+3. The decoder produces a "benign-like" reconstruction
+4. The mismatch between the attack input and benign-like output produces a high anomaly score
 
 ## Architecture
 
 ```
-┌─────────────┐      ┌──────────────────┐       ┌──────────────────┐       ┌─────────────┐       ┌─────────────┐
+┌─────────────┐      ┌──────────────────┐       ┌──────────────────┐       ┌─────────── ──┐       ┌─────────────┐
 │   Input x   │      │   BiGRU Encoder  │       │    Neural ODE    │       │ MLP Decoder  │       │  Output x̂   │
 │ (B, 50, 49) │─────>│  2-layer BiGRU   │──────>│  dz/dt = fθ(z,t) │──────>│  MLP + SiLU  │──────>│ (B, 50, 49) │
 │             │      │  128 hidden/dir  │       │  dopri5, t∈[0,1] │       │  no output   │       │             │
 └─────────────┘      └──────────────────┘       └──────────────────┘       │  activation  │       └──────┬──────┘
-                              │                          │                  └─────────────┘              │
-                         z₀ (B, 32)                 z₁ (B, 32)                                          │
-                                                                                                        ▼
+                              │                          │                 └────────── ───┘              │
+                         z₀ (B, 32)                 z₁ (B, 32)                                           │
+                                                                                                         ▼
                                                                                               ┌─────────────────┐
                                                                                               │  Anomaly Score  │
-                                                                                              │ MSE(x, x̂) > τ  │
+                                                                                              │ MSE(x, x̂) > τ   │
                                                                                               │    → Alert      │
                                                                                               └─────────────────┘
 ```
@@ -24,59 +68,49 @@ Unsupervised anomaly detection system for network traffic using a Neural ODE Aut
 
 | Component | Architecture | Parameters |
 |-----------|-------------|------------|
-| **Encoder** | BiGRU (2 layers, 128 hidden, bidirectional) → Linear(256, 32) | ~530K |
+| **Encoder** | BiGRU (2 layers, 128 hidden, bidirectional) → LayerNorm → Dropout(0.2) → Linear(256, 32) | ~530K |
 | **Latent space** | 32-dimensional | — |
-| **Neural ODE** | MLP dynamics: [z‖t] (33) → 128 → 128 → 32, SiLU, dopri5 solver | ~21K |
-| **Decoder** | MLP: 32 → 128 → 128 → 2450, SiLU, no output activation | ~253K |
-| **Total** | | **~804K** |
+| **Neural ODE** | MLP dynamics: $[z \| t]$ (33) → LN+128 → LN+128 → 32, SiLU, dopri5 | ~22K |
+| **Decoder** | MLP: 32 → LN+256 → LN+256 → 2450, SiLU, Dropout(0.2) | ~620K |
+| **Total** | | **~1.17M** |
 
 ### BiGRU Encoder
 
-Maps a window of 50 network flows into a 32-dimensional latent vector:
+Maps a window of $T$ network flows into a latent vector $z_0$:
 
-```
-x ∈ ℝ^{B×50×49}  →  BiGRU  →  [h_fwd ‖ h_bwd] ∈ ℝ^{B×256}  →  Linear  →  z₀ ∈ ℝ^{B×32}
-```
+$$x \in \mathbb{R}^{B \times 50 \times 49} \xrightarrow{\text{BiGRU}} [\overrightarrow{h_T} \| \overleftarrow{h_1}] \in \mathbb{R}^{B \times 256} \xrightarrow{\text{LN + Linear}} z_0 \in \mathbb{R}^{B \times 32}$$
 
-The bidirectional GRU processes the sequence in both directions and captures temporal patterns in flow ordering. The final hidden states from forward and backward passes are concatenated and linearly projected to the latent dimension.
+The bidirectional GRU processes the sequence in both directions, capturing temporal patterns in flow ordering. The final hidden states from forward and backward passes are concatenated, normalized (LayerNorm), and linearly projected to the latent dimension. Dropout (0.2) is applied between GRU layers and before projection.
 
 ### Neural ODE
 
-Defines continuous-time latent dynamics via an ODE initial value problem:
+The core innovation: a continuous-time transformation in latent space defined as an ODE initial value problem:
 
-```
-dz/dt = fθ(z, t)       z₁ = z₀ + ∫₀¹ fθ(z(t), t) dt
-```
+$$\frac{dz}{dt} = f_\theta(z, t), \quad z(0) = z_0, \quad z_1 = z_0 + \int_0^1 f_\theta(z(t), t) \, dt$$
 
-The dynamics function `fθ` is a small MLP that takes the concatenation `[z ‖ t]` as input. The Dormand-Prince solver (`dopri5`) adaptively integrates from `t=0` to `t=1` with tolerances `atol=rtol=1e-5`.
-
-**Key idea:** The ODE learns how normal traffic evolves in latent space. Attack traffic encodes to unfamiliar latent regions → the ODE evolves it toward benign dynamics → decoder produces a "benign-like" reconstruction → high MSE signals the anomaly.
+The dynamics function $f_\theta$ is an MLP with LayerNorm and SiLU activations that takes the concatenation $[z \| t] \in \mathbb{R}^{33}$ as input. The Dormand-Prince solver (`dopri5`) adaptively integrates from $t=0$ to $t=1$ with tolerances `atol=rtol=1e-5`. No dropout in $f_\theta$ — the adaptive solver calls it multiple times per step, so stochastic dropout would break error estimation.
 
 ### MLP Decoder
 
-Reconstructs the full 50×49 window from the evolved latent vector:
+Reconstructs the full $50 \times 49$ window from the evolved latent vector:
 
-```
-z₁ ∈ ℝ^{B×32}  →  Linear(128) + SiLU  →  Linear(128) + SiLU  →  Linear(2450)  →  reshape  →  x̂ ∈ ℝ^{B×50×49}
-```
+$$z_1 \in \mathbb{R}^{32} \xrightarrow{\text{LN+SiLU+Dropout}} \mathbb{R}^{256} \xrightarrow{\text{LN+SiLU+Dropout}} \mathbb{R}^{256} \xrightarrow{\text{Linear}} \mathbb{R}^{2450} \xrightarrow{\text{reshape}} \hat{x} \in \mathbb{R}^{50 \times 49}$$
 
 No output activation — targets are RobustScaler-transformed and unbounded.
 
-### Loss Function & Anomaly Score
+### Regularization
 
-**Training loss** (MSE, benign-only):
+In addition to the reconstruction loss, the model uses a **kinetic energy regularization** on the ODE dynamics:
 
-```
-L = (1/N) Σᵢ (1/(T·D)) ‖xᵢ - x̂ᵢ‖²_F
-```
+$$\mathcal{R}_{\text{KE}}(\theta) = \int_0^1 \left\| f_\theta(z(t), t) \right\|^2 dt$$
 
-**Anomaly score** (per-window, at inference):
+This penalizes the total "energy" of the latent trajectory, encouraging straight-line paths and smooth dynamics without constraining the latent space to a specific distribution (unlike the KL divergence in VAEs). This is more natural for Neural ODEs and preserves the geometric flexibility of the latent space. See [Finlay et al., 2020](https://arxiv.org/abs/2002.02798).
 
-```
-score(x) = (1/(T·D)) ‖x - x̂‖²_F       anomaly if score > τ
-```
+The total loss is:
 
-The threshold `τ` is tuned on the validation set to maximize F1-score.
+$$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{MSE}} + \lambda \cdot \mathcal{R}_{\text{KE}}$$
+
+where $\lambda$ controls the regularization strength.
 
 ## Dataset
 
@@ -124,7 +158,7 @@ Every decision is documented with rationale in [`notebooks/02_feature_engineerin
 │                     ┌────────────────┐ ┌──────────────┐  ┌──────────────┐    │
 │                     │  Train (70%)   │ │  Val (15%)   │  │  Test (15%)  │    │
 │                     │  4.42M flows   │ │  948K flows  │  │  948K flows  │    │
-│                     └───────┬────────┘ └──────┬───────┘  └──────┬───────┘    │
+│                     └───────┬────────┘ └──────┬───────┘  └───── ─┬──────┘    │
 │                             │                 │                  │           │
 │                             ▼                 │                  │           │
 │                     ┌────────────────┐        │                  │           │
@@ -259,7 +293,8 @@ data/processed/
 ├── notebooks/
 │   ├── 01_eda.ipynb                    # Exploratory data analysis
 │   ├── 02_feature_engineering.ipynb    # Feature selection & dataset decisions
-│   └── 03_model_architecture.ipynb     # Architecture docs, math, diagrams
+│   ├── 03_model_architecture.ipynb     # Architecture docs, math, diagrams
+│   └── 04_training.ipynb              # Training with progress bars and curves
 ├── src/
 │   ├── __init__.py                     # Exports model classes
 │   ├── preprocessing.py                # Full preprocessing pipeline

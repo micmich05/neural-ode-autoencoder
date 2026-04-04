@@ -19,9 +19,6 @@ class BiGRUEncoder(nn.Module):
 
     Input:  (B, seq_len, input_dim)   e.g. (B, 50, 49)
     Output: (B, latent_dim)           e.g. (B, 32)
-
-    Uses the final hidden states from both directions, concatenated and
-    projected to the latent dimension.
     """
 
     def __init__(
@@ -30,6 +27,8 @@ class BiGRUEncoder(nn.Module):
         hidden_size: int = 128,
         num_layers: int = 2,
         latent_dim: int = 32,
+        dropout: float = 0.0,
+        layer_norm: bool = False,
     ):
         super().__init__()
         self.gru = nn.GRU(
@@ -38,55 +37,64 @@ class BiGRUEncoder(nn.Module):
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
-        # Concat forward + backward final hidden → 2 * hidden_size
-        self.projection = nn.Linear(2 * hidden_size, latent_dim)
+        concat_size = 2 * hidden_size
+        self.norm = nn.LayerNorm(concat_size) if layer_norm else nn.Identity()
+        self.dropout = nn.Dropout(dropout)
+        self.projection = nn.Linear(concat_size, latent_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # h_n: (num_layers * 2, B, hidden_size) for bidirectional
         _, h_n = self.gru(x)
-        # Take last layer: forward = h_n[-2], backward = h_n[-1]
-        h_fwd = h_n[-2]  # (B, hidden_size)
-        h_bwd = h_n[-1]  # (B, hidden_size)
-        h_cat = torch.cat([h_fwd, h_bwd], dim=-1)  # (B, 2*hidden_size)
-        z0 = self.projection(h_cat)  # (B, latent_dim)
-        return z0
+        # Last layer: forward = h_n[-2], backward = h_n[-1]
+        h_cat = torch.cat([h_n[-2], h_n[-1]], dim=-1)  # (B, 2*hidden_size)
+        h_cat = self.norm(h_cat)
+        h_cat = self.dropout(h_cat)
+        return self.projection(h_cat)  # (B, latent_dim)
 
 
 class ODEFunc(nn.Module):
     """Dynamics function f_θ(z, t) for the Neural ODE.
 
-    Defines dz/dt = f_θ(z, t) where f_θ is a small MLP that takes the
-    current state z and time t as input. The ODE solver (dopri5) calls
-    this function adaptively to integrate z from t=0 to t=1.
+    Defines dz/dt = f_θ(z, t). No dropout — the adaptive solver calls this
+    multiple times per step, so stochastic dropout would break error estimation.
+    LayerNorm is safe since it's deterministic and per-sample.
 
     Input:  t (scalar), z (B, latent_dim)
     Output: dz/dt (B, latent_dim)
     """
 
-    def __init__(self, latent_dim: int = 32, hidden_size: int = 128):
+    def __init__(
+        self,
+        latent_dim: int = 32,
+        hidden_size: int = 128,
+        num_layers: int = 3,
+        layer_norm: bool = False,
+    ):
         super().__init__()
-        # +1 for time concatenation
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim + 1, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, latent_dim),
-        )
+        layers = []
+        in_dim = latent_dim + 1  # +1 for time concatenation
+        for i in range(num_layers - 1):
+            out_dim = hidden_size
+            layers.append(nn.Linear(in_dim, out_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(out_dim))
+            layers.append(nn.SiLU())
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, latent_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, t: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        # Expand t to match batch dimension: scalar → (B, 1)
         t_expanded = t.expand(z.shape[0], 1)
-        z_t = torch.cat([z, t_expanded], dim=-1)  # (B, latent_dim + 1)
+        z_t = torch.cat([z, t_expanded], dim=-1)
         return self.net(z_t)
 
 
 class MLPDecoder(nn.Module):
     """MLP decoder that reconstructs flow windows from latent vectors.
 
-    Input:  (B, latent_dim)                    e.g. (B, 32)
-    Output: (B, seq_len, input_dim)            e.g. (B, 50, 49)
+    Input:  (B, latent_dim)           e.g. (B, 32)
+    Output: (B, seq_len, input_dim)   e.g. (B, 50, 49)
 
     No output activation — targets are RobustScaler-transformed and unbounded.
     """
@@ -94,24 +102,33 @@ class MLPDecoder(nn.Module):
     def __init__(
         self,
         latent_dim: int = 32,
-        hidden_size: int = 128,
+        hidden_size: int = 256,
+        num_layers: int = 3,
         seq_len: int = 50,
         input_dim: int = 49,
+        dropout: float = 0.0,
+        layer_norm: bool = False,
     ):
         super().__init__()
         self.seq_len = seq_len
         self.input_dim = input_dim
-        self.net = nn.Sequential(
-            nn.Linear(latent_dim, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size),
-            nn.SiLU(),
-            nn.Linear(hidden_size, seq_len * input_dim),
-        )
+
+        layers = []
+        in_dim = latent_dim
+        for i in range(num_layers - 1):
+            out_dim = hidden_size
+            layers.append(nn.Linear(in_dim, out_dim))
+            if layer_norm:
+                layers.append(nn.LayerNorm(out_dim))
+            layers.append(nn.SiLU())
+            layers.append(nn.Dropout(dropout))
+            in_dim = out_dim
+        layers.append(nn.Linear(in_dim, seq_len * input_dim))
+        self.net = nn.Sequential(*layers)
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        out = self.net(z)  # (B, seq_len * input_dim)
-        return out.view(-1, self.seq_len, self.input_dim)  # (B, seq_len, input_dim)
+        out = self.net(z)
+        return out.view(-1, self.seq_len, self.input_dim)
 
 
 class NeuralODEAutoencoder(nn.Module):
@@ -120,8 +137,7 @@ class NeuralODEAutoencoder(nn.Module):
     Pipeline:
         x → BiGRUEncoder → z₀ → ODE(t=0→1) → z₁ → MLPDecoder → x̂
 
-    The anomaly score for a window is the mean squared reconstruction error:
-        score = (1 / (seq_len × input_dim)) × ||x - x̂||²_F
+    Anomaly score = per-window MSE: (1/(T·D)) × ||x - x̂||²_F
     """
 
     def __init__(self, config: dict):
@@ -138,21 +154,27 @@ class NeuralODEAutoencoder(nn.Module):
             hidden_size=enc_cfg["hidden_size"],
             num_layers=enc_cfg["num_layers"],
             latent_dim=latent_dim,
+            dropout=enc_cfg.get("dropout", 0.0),
+            layer_norm=enc_cfg.get("layer_norm", False),
         )
 
         self.ode_func = ODEFunc(
             latent_dim=latent_dim,
             hidden_size=ode_cfg["hidden_size"],
+            num_layers=ode_cfg.get("num_layers", 3),
+            layer_norm=ode_cfg.get("layer_norm", False),
         )
 
         self.decoder = MLPDecoder(
             latent_dim=latent_dim,
             hidden_size=dec_cfg["hidden_size"],
+            num_layers=dec_cfg.get("num_layers", 3),
             seq_len=window_size,
             input_dim=input_dim,
+            dropout=dec_cfg.get("dropout", 0.0),
+            layer_norm=dec_cfg.get("layer_norm", False),
         )
 
-        # ODE solver settings
         self.solver = ode_cfg["solver"]
         self.atol = ode_cfg["atol"]
         self.rtol = ode_cfg["rtol"]
@@ -160,48 +182,64 @@ class NeuralODEAutoencoder(nn.Module):
             [0.0, ode_cfg["integration_time"]], dtype=torch.float32
         )
 
+        # Kinetic energy regularization: number of time points for quadrature
+        self.ke_n_steps = ode_cfg.get("ke_n_steps", 10)
+
     def forward(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass through the full autoencoder.
-
-        Args:
-            x: Input windows (B, seq_len, input_dim)
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward pass.
 
         Returns:
-            x_hat: Reconstructed windows (B, seq_len, input_dim)
-            z0: Latent initial state (B, latent_dim) — useful for visualization
+            x_hat: Reconstructed windows (B, T, D)
+            z0: Initial latent state (B, latent_dim)
+            ke_reg: Kinetic energy regularization scalar
         """
-        # Encode
-        z0 = self.encoder(x)  # (B, latent_dim)
+        z0 = self.encoder(x)
 
-        # Integrate ODE from t=0 to t=T
-        t_span = self.integration_time.to(x.device)
+        # Integrate with multiple time points for kinetic energy estimation
+        t_span = torch.linspace(0, self.integration_time[-1].item(),
+                                self.ke_n_steps, device=x.device)
         z_traj = odeint(
-            self.ode_func,
-            z0,
-            t_span,
-            method=self.solver,
-            atol=self.atol,
-            rtol=self.rtol,
-        )  # (2, B, latent_dim) — states at t=0 and t=T
-        z1 = z_traj[-1]  # (B, latent_dim) — state at t=T
+            self.ode_func, z0, t_span,
+            method=self.solver, atol=self.atol, rtol=self.rtol,
+        )  # (ke_n_steps, B, latent_dim)
+        z1 = z_traj[-1]  # (B, latent_dim)
 
-        # Decode
-        x_hat = self.decoder(z1)  # (B, seq_len, input_dim)
+        # Kinetic energy: ∫₀¹ ||f_θ(z(t), t)||² dt ≈ (1/K) Σ ||f_θ(z_k, t_k)||²
+        ke_reg = self._kinetic_energy(z_traj, t_span)
 
-        return x_hat, z0
+        x_hat = self.decoder(z1)
+        return x_hat, z0, ke_reg
+
+    def _kinetic_energy(
+        self, z_traj: torch.Tensor, t_span: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute kinetic energy along the ODE trajectory.
+
+        Uses the trapezoidal rule to approximate:
+            R_KE = (1/B) ∫₀¹ ||f_θ(z(t), t)||² dt
+
+        Args:
+            z_traj: (K, B, latent_dim) — latent states at K time points
+            t_span: (K,) — time points
+
+        Returns:
+            Scalar kinetic energy (averaged over batch).
+        """
+        K = t_span.shape[0]
+        velocities_sq = []
+        for k in range(K):
+            v = self.ode_func(t_span[k], z_traj[k])  # (B, latent_dim)
+            velocities_sq.append((v ** 2).sum(dim=-1))  # (B,)
+        # Stack: (K, B), apply trapezoidal rule over time, then average over batch
+        v_sq = torch.stack(velocities_sq, dim=0)  # (K, B)
+        dt = t_span[1:] - t_span[:-1]  # (K-1,)
+        # Trapezoidal: ∫ ≈ Σ (f(t_k) + f(t_{k+1})) / 2 * dt_k
+        integral = (0.5 * (v_sq[:-1] + v_sq[1:]) * dt.unsqueeze(1)).sum(dim=0)  # (B,)
+        return integral.mean()
 
     def anomaly_score(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute per-window anomaly score (mean squared error).
-
-        Args:
-            x: Input windows (B, seq_len, input_dim)
-
-        Returns:
-            scores: Per-window MSE (B,)
-        """
-        x_hat, _ = self.forward(x)
-        # MSE per window: mean over seq_len and input_dim
-        scores = ((x - x_hat) ** 2).mean(dim=(1, 2))
-        return scores
+        """Per-window MSE anomaly score (B,)."""
+        x_hat, _, _ = self.forward(x)
+        return ((x - x_hat) ** 2).mean(dim=(1, 2))

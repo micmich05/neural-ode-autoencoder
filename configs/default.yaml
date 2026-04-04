@@ -58,20 +58,28 @@ model:
     hidden_size: 128
     num_layers: 2
     bidirectional: true
+    dropout: 0.2              # dropout between GRU layers & before projection
+    layer_norm: true          # LayerNorm on concatenated hidden states
 
   latent_dim: 32
 
   neural_ode:
     hidden_size: 128
+    num_layers: 3             # depth of dynamics MLP
     activation: silu
+    layer_norm: true          # LayerNorm in dynamics MLP
     solver: dopri5
     atol: 1.0e-5
     rtol: 1.0e-5
     integration_time: 1.0
+    ke_n_steps: 10            # time points for kinetic energy quadrature
 
   decoder:
-    hidden_size: 128
+    hidden_size: 256          # wider decoder to reconstruct 2450-dim output
+    num_layers: 3             # depth of decoder MLP
     activation: silu
+    dropout: 0.2              # dropout between decoder layers
+    layer_norm: true          # LayerNorm in decoder MLP
 
 training:
   batch_size: 256
@@ -80,4 +88,6 @@ training:
   epochs: 200
   optimizer: adam
   scheduler: cosine
+  grad_clip: 1.0              # max gradient norm
+  lambda_ke: 0.01             # kinetic energy regularization weight
   early_stopping_patience: 10
