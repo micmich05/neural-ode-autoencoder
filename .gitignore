@@ -32,6 +32,12 @@ mlartifacts/
 .DS_Store
 Thumbs.db
 
+# Checkpoints
+checkpoints/
+
+# Results
+results/
+
 # IDE
 .vscode/
 .idea/

@@ -5,21 +5,78 @@ Unsupervised anomaly detection system for network traffic using a Neural ODE Aut
 ## Architecture
 
 ```
-Network Flows → [BiGRU Encoder] → z₀ → [Neural ODE: dz/dt = fθ(z,t)] → z₁ → [MLP Decoder] → Reconstruction
-                                                                                                      ↓
-                                                                                              Reconstruction Error
-                                                                                                      ↓
-                                                                                              Anomaly Score → Alert
+┌─────────────┐      ┌──────────────────┐       ┌──────────────────┐       ┌─────────────┐       ┌─────────────┐
+│   Input x   │      │   BiGRU Encoder  │       │    Neural ODE    │       │ MLP Decoder  │       │  Output x̂   │
+│ (B, 50, 49) │─────>│  2-layer BiGRU   │──────>│  dz/dt = fθ(z,t) │──────>│  MLP + SiLU  │──────>│ (B, 50, 49) │
+│             │      │  128 hidden/dir  │       │  dopri5, t∈[0,1] │       │  no output   │       │             │
+└─────────────┘      └──────────────────┘       └──────────────────┘       │  activation  │       └──────┬──────┘
+                              │                          │                  └─────────────┘              │
+                         z₀ (B, 32)                 z₁ (B, 32)                                          │
+                                                                                                        ▼
+                                                                                              ┌─────────────────┐
+                                                                                              │  Anomaly Score  │
+                                                                                              │ MSE(x, x̂) > τ  │
+                                                                                              │    → Alert      │
+                                                                                              └─────────────────┘
 ```
 
-| Component | Details |
-|-----------|---------|
-| **Encoder** | Bidirectional GRU (2 layers, 128 hidden) |
-| **Latent space** | 32-dimensional |
-| **Neural ODE** | MLP dynamics with SiLU activation, Dormand-Prince (dopri5) solver |
-| **Decoder** | MLP with SiLU activation |
+### Component Summary
 
-**Key idea:** The Neural ODE learns a continuous-time dynamical system `dz/dt = fθ(z,t)` that captures how normal traffic evolves in latent space. DDoS traffic follows fundamentally different dynamics, producing high reconstruction error.
+| Component | Architecture | Parameters |
+|-----------|-------------|------------|
+| **Encoder** | BiGRU (2 layers, 128 hidden, bidirectional) → Linear(256, 32) | ~530K |
+| **Latent space** | 32-dimensional | — |
+| **Neural ODE** | MLP dynamics: [z‖t] (33) → 128 → 128 → 32, SiLU, dopri5 solver | ~21K |
+| **Decoder** | MLP: 32 → 128 → 128 → 2450, SiLU, no output activation | ~253K |
+| **Total** | | **~804K** |
+
+### BiGRU Encoder
+
+Maps a window of 50 network flows into a 32-dimensional latent vector:
+
+```
+x ∈ ℝ^{B×50×49}  →  BiGRU  →  [h_fwd ‖ h_bwd] ∈ ℝ^{B×256}  →  Linear  →  z₀ ∈ ℝ^{B×32}
+```
+
+The bidirectional GRU processes the sequence in both directions and captures temporal patterns in flow ordering. The final hidden states from forward and backward passes are concatenated and linearly projected to the latent dimension.
+
+### Neural ODE
+
+Defines continuous-time latent dynamics via an ODE initial value problem:
+
+```
+dz/dt = fθ(z, t)       z₁ = z₀ + ∫₀¹ fθ(z(t), t) dt
+```
+
+The dynamics function `fθ` is a small MLP that takes the concatenation `[z ‖ t]` as input. The Dormand-Prince solver (`dopri5`) adaptively integrates from `t=0` to `t=1` with tolerances `atol=rtol=1e-5`.
+
+**Key idea:** The ODE learns how normal traffic evolves in latent space. Attack traffic encodes to unfamiliar latent regions → the ODE evolves it toward benign dynamics → decoder produces a "benign-like" reconstruction → high MSE signals the anomaly.
+
+### MLP Decoder
+
+Reconstructs the full 50×49 window from the evolved latent vector:
+
+```
+z₁ ∈ ℝ^{B×32}  →  Linear(128) + SiLU  →  Linear(128) + SiLU  →  Linear(2450)  →  reshape  →  x̂ ∈ ℝ^{B×50×49}
+```
+
+No output activation — targets are RobustScaler-transformed and unbounded.
+
+### Loss Function & Anomaly Score
+
+**Training loss** (MSE, benign-only):
+
+```
+L = (1/N) Σᵢ (1/(T·D)) ‖xᵢ - x̂ᵢ‖²_F
+```
+
+**Anomaly score** (per-window, at inference):
+
+```
+score(x) = (1/(T·D)) ‖x - x̂‖²_F       anomaly if score > τ
+```
+
+The threshold `τ` is tuned on the validation set to maximize F1-score.
 
 ## Dataset
 
@@ -196,11 +253,20 @@ data/processed/
 ├── data/
 │   ├── raw/archive/                    # Raw CSE-CIC-IDS2018 parquets (not tracked)
 │   └── processed/                      # Output tensors (not tracked)
+├── checkpoints/                        # Model checkpoints (not tracked)
+├── results/                            # Evaluation plots (not tracked)
+├── figures/                            # Architecture diagrams from notebooks
 ├── notebooks/
 │   ├── 01_eda.ipynb                    # Exploratory data analysis
-│   └── 02_feature_engineering.ipynb    # Feature selection & dataset decisions
+│   ├── 02_feature_engineering.ipynb    # Feature selection & dataset decisions
+│   └── 03_model_architecture.ipynb     # Architecture docs, math, diagrams
 ├── src/
-│   └── preprocessing.py                # Full preprocessing pipeline
+│   ├── __init__.py                     # Exports model classes
+│   ├── preprocessing.py                # Full preprocessing pipeline
+│   ├── dataset.py                      # FlowWindowDataset + DataLoader factory
+│   ├── model.py                        # BiGRUEncoder, ODEFunc, MLPDecoder, NeuralODEAutoencoder
+│   ├── train.py                        # Training loop with early stopping
+│   └── evaluate.py                     # Anomaly scoring, metrics, plots
 ├── requirements.txt
 └── README.md
 ```
@@ -233,6 +299,22 @@ python src/preprocessing.py --config configs/default.yaml
 ```
 
 This generates train/val/test tensors in `data/processed/`.
+
+### Training
+
+```bash
+python src/train.py --config configs/default.yaml
+```
+
+Trains on benign-only windows with MSE loss, cosine annealing LR, and early stopping. Best checkpoint saved to `checkpoints/best.pt`.
+
+### Evaluation
+
+```bash
+python src/evaluate.py --config configs/default.yaml --checkpoint checkpoints/best.pt --split test
+```
+
+Computes AUROC, AUPRC, F1-score and generates score distribution, ROC, and precision-recall plots in `results/`.
 
 ## Training Approach
 
