@@ -2,8 +2,9 @@
 Preprocessing pipeline for CSE-CIC-IDS2018 (parquet format).
 
 Loads parquet files, removes duplicates, selects features, performs a
-stratified split, normalizes with RobustScaler (fit on train-benign only),
-creates fixed-size windows, and saves train/val/test tensors.
+stratified split, applies log1p compression, normalizes with RobustScaler
+(fit on train-benign only), clips outliers, creates fixed-size windows,
+and saves train/val/test tensors.
 
 Design decisions are documented in notebooks/02_feature_engineering.ipynb.
 
@@ -90,6 +91,16 @@ def clean_and_select_features(
 
     print(f"  Final shape: {df.shape}")
     return df, labels
+
+
+def log1p_transform(X: np.ndarray) -> np.ndarray:
+    """Apply sign-preserving log1p: sign(x) * log1p(|x|).
+
+    Compresses heavy-tailed distributions (e.g. 10^11 → ~25) while
+    preserving sign and ordering. Safe for all values including zero
+    and negatives. Small values (|x| << 1) are approximately unchanged.
+    """
+    return np.sign(X) * np.log1p(np.abs(X))
 
 
 def stratified_split(
@@ -208,20 +219,42 @@ def main():
     X_train_benign = X_train[benign_mask]
     print(f"  Train: {len(X_train):,} → {len(X_train_benign):,} benign-only flows")
 
-    # 5. Fit scaler on training benign data only
-    print("\n=== 5. Fitting scaler on training benign data ===")
+    # 5. Log1p transform → RobustScaler → clip
+    #    Network traffic features span many orders of magnitude (0 to 10^11).
+    #    RobustScaler alone fails when IQR=0 (e.g. Active/Idle features where
+    #    most benign flows are 0). Log1p compresses these ranges first.
+    clip_value = prep_cfg.get("clip_value", 10.0)
+
+    print("\n=== 5a. Log1p transform (compress heavy tails) ===")
+    X_train_benign = log1p_transform(X_train_benign.values)
+    print(f"  Applied sign(x)*log1p(|x|) to {X_train_benign.shape[1]} features")
+    print(f"  Range after log1p: [{X_train_benign.min():.2f}, {X_train_benign.max():.2f}]")
+
+    X_val, y_val = splits["val"]
+    X_val_log = log1p_transform(X_val.values)
+
+    X_test, y_test = splits["test"]
+    X_test_log = log1p_transform(X_test.values)
+
+    print("\n=== 5b. Fitting RobustScaler on training benign data ===")
     scaler = RobustScaler()
     scaler.fit(X_train_benign)
     print(f"  Scaler fitted on {len(X_train_benign):,} benign training flows")
+    n_iqr_zero = np.sum(scaler.scale_ == 1.0)
+    print(f"  Features with IQR=0 after log1p: {n_iqr_zero}")
 
-    # Scale all splits
     X_train_scaled = scaler.transform(X_train_benign).astype(np.float32)
+    X_val_scaled = scaler.transform(X_val_log).astype(np.float32)
+    X_test_scaled = scaler.transform(X_test_log).astype(np.float32)
 
-    X_val, y_val = splits["val"]
-    X_val_scaled = scaler.transform(X_val).astype(np.float32)
-
-    X_test, y_test = splits["test"]
-    X_test_scaled = scaler.transform(X_test).astype(np.float32)
+    print(f"\n=== 5c. Clipping to [-{clip_value}, {clip_value}] ===")
+    for name, X in [("train", X_train_scaled), ("val", X_val_scaled), ("test", X_test_scaled)]:
+        n_clipped = np.sum(np.abs(X) > clip_value)
+        pct = n_clipped / X.size * 100
+        print(f"  {name:5s}: {n_clipped:,} values clipped ({pct:.3f}%)")
+    X_train_scaled = np.clip(X_train_scaled, -clip_value, clip_value)
+    X_val_scaled = np.clip(X_val_scaled, -clip_value, clip_value)
+    X_test_scaled = np.clip(X_test_scaled, -clip_value, clip_value)
 
     # Create binary labels for val/test (0=benign, 1=attack)
     y_train_binary = np.zeros(len(X_train_benign), dtype=np.int64)
@@ -248,15 +281,24 @@ def main():
         torch.save(torch.from_numpy(X), os.path.join(output_dir, f"{name}_X.pt"))
         torch.save(torch.from_numpy(y), os.path.join(output_dir, f"{name}_y.pt"))
 
+    preprocessing_meta = {
+        "log1p": True,
+        "scaler": "RobustScaler",
+        "clip_value": clip_value,
+        "feature_names": feature_names,
+    }
     with open(os.path.join(output_dir, "scaler.pkl"), "wb") as f:
         pickle.dump(scaler, f)
 
     with open(os.path.join(output_dir, "feature_names.pkl"), "wb") as f:
         pickle.dump(feature_names, f)
 
+    with open(os.path.join(output_dir, "preprocessing_meta.pkl"), "wb") as f:
+        pickle.dump(preprocessing_meta, f)
+
     print(f"  Saved to {output_dir}/")
     print(f"  Features: {len(feature_names)}")
-    print(f"  Scaler: RobustScaler (fitted on train benign)")
+    print(f"  Pipeline: log1p → RobustScaler → clip(±{clip_value})")
 
     print("\n=== Preprocessing complete ===")
 

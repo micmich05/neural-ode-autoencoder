@@ -48,7 +48,9 @@ preprocessing:
     val: 0.15
     test: 0.15
 
-  scaler: robust  # RobustScaler fitted on train-benign only
+  log1p: true                # sign(x)*log1p(|x|) before scaling — compresses heavy tails
+  scaler: robust              # RobustScaler fitted on train-benign only
+  clip_value: 10.0            # clip scaled features to [-10, 10]
 
 model:
   input_dim: 49               # features after selection (77 - 28 dropped)
